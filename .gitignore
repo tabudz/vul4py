@@ -1,0 +1,30 @@
+# cloned source trees (re-creatable from dataset/vul4py.csv)
+workspaces/*/
+workspaces/.vul4py_tools/
+workspaces/prepare_summary.tsv
+workspaces/scan_report.tsv
+
+# agent outputs (re-creatable from prompts + scripts/run_agent.py)
+runs/*/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# secrets
+.env
+.env.local
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# misc
+*.log
+*.tmp
