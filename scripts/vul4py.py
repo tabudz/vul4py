@@ -945,11 +945,26 @@ def _exploit_passes_fixed_struct(res: Optional[Dict[str, Any]]) -> Optional[bool
 
 def _infra_broken(rc: int, res: Optional[Dict[str, Any]]) -> bool:
     """A run is 'infra broken' if pytest didn't produce a junit AND rc isn't a
-    sentinel we already understand (0=clean pass, 999=no tests, -1=exception,
-    -2=timeout). That covers collection errors, plugin failures, usage errors."""
+    sentinel we already understand. Sentinels we accept:
+      - 0: clean pass
+      - 999: no tests
+      - -1: exception in our runner
+      - -2: timeout
+      - >= 128: process died from a Unix signal (SIGSEGV=139, SIGABRT=134,
+        SIGKILL=137, ...). For C-extension vulnerabilities the exploit
+        manifests as a crash, not a Python test failure; pytest dies before
+        writing junit. Treat as a meaningful exit code -- rc-based fallback
+        correctly classifies it (caught on vulnerable, broken-fix on fixed).
+    Otherwise (rc in {1,2,3,4,5}): pytest blew up before producing junit
+    (collection error, plugin error, usage error, no tests collected).
+    """
     if res is not None:
         return False
-    return rc not in (0, 999, -1, -2)
+    if rc in (0, 999, -1, -2):
+        return False
+    if rc >= 128:
+        return False
+    return True
 
 
 def _scan_one_cve(args_for_worker) -> Dict[str, object]:
