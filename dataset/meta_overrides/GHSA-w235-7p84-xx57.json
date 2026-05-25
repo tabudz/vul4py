@@ -1,0 +1,6 @@
+{
+  "_note": "[auto_skip: 1 env-noise tests deselected on fixed]",
+  "set": {
+    "functional_test_cmd_base": "python -m pytest --deselect tornado/test/curl_httpclient_test.py::CurlHTTPClientCommonTestCase::test_bind_source_ip"
+  }
+}
