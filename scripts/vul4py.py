@@ -575,16 +575,6 @@ def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path)
     return cp.returncode
 
 
-_FIXTURE_DIRNAMES = {"data", "fixtures", "test_data", "testdata", "samples", "snapshots"}
-
-
-def _is_strict_test_filename(name: str) -> bool:
-    """A file whose own name says 'I am a pytest test module'."""
-    if not name.endswith(".py"):
-        return False
-    return name.startswith("test_") or name.endswith("_test.py")
-
-
 def backport_artifacts(
     fixed_dir: Path,
     target_dir: Path,
@@ -592,79 +582,65 @@ def backport_artifacts(
     new_code_files: List[str],
 ):
     """
-    Bring artifacts from fixed_dir into target_dir so the regression tests can
-    run against target_dir's (vulnerable) source.
+    Overlay test files from fixed_dir directly into target_dir at their
+    original relative paths. target_dir's existing package layout
+    (__init__.py chain, conftest.py, data/fixture directories, etc.) is
+    reused as-is, so package-relative imports and listdir() of adjacent
+    fixture dirs all resolve naturally.
 
-    Beyond the headline new_test_files / new_code_files, we also copy:
-      - every __init__.py from the repo root down to each test's parent
-        (so package-relative imports resolve)
-      - every NON-test .py sibling of each test file (conftest.py, helper
-        modules like tz_stub.py)
-      - any data/fixtures-style sibling subdirectory (parametrised tests
-        commonly listdir() these at import time)
+    This mutates target_dir's source tree. `_restore_target` reverts via
+    `git checkout HEAD` at the start of each worker so re-runs are clean.
 
-    These extras are written under backported_tests/ alongside the test
-    itself so pytest sees a self-contained tree.
+    new_code_files are mirrored into target_dir/backported_support/ for
+    inspection/debug but NOT placed on PYTHONPATH -- adding the fixed
+    helper code to the import path would un-fix the vulnerability for
+    classes of fixes where the patch is delivered via a modified helper.
     """
-    back_tests_root = target_dir / "backported_tests"
-    back_support_root = target_dir / "backported_support"
-    ensure_dir(back_tests_root)
-    ensure_dir(back_support_root)
+    ensure_dir(target_dir)
 
-    seen: set = set()
-
-    def copy_into_tests(rel: str):
-        if not rel or rel in seen:
-            return
-        src = fixed_dir / rel
+    # Overlay test files into target_dir at their canonical paths.
+    for relpath in new_test_files:
+        src = fixed_dir / relpath
         if not src.exists():
-            return
-        dst = back_tests_root / rel
+            continue
+        dst = target_dir / relpath
         ensure_dir(dst.parent)
         if src.is_dir():
+            # tolerate test "files" that are directories (rare)
             shutil.copytree(src, dst, dirs_exist_ok=True)
         else:
-            shutil.copy2(src, dst)
-        seen.add(rel)
+            # `copy` (not copy2) deliberately resets mtime so any stale .pyc
+            # alongside the original gets invalidated.
+            shutil.copy(src, dst)
 
-    # 1. The new test files themselves.
-    for relpath in new_test_files:
-        copy_into_tests(relpath)
-
-    # 2. Package skeleton: copy __init__.py from each ancestor dir of every
-    #    new test file (if it exists in the fixed checkout).
-    for relpath in new_test_files:
-        parts = Path(relpath).parts
-        for i in range(1, len(parts)):
-            anc = Path(*parts[:i])
-            init_rel = str(anc / "__init__.py")
-            if (fixed_dir / init_rel).is_file():
-                copy_into_tests(init_rel)
-
-    # 3. Siblings of each new test file:
-    #     - non-test .py files in the same dir (conftest.py, tz_stub.py, ...)
-    #     - data/fixtures-style subdirs in the same dir
-    for relpath in new_test_files:
-        parent_rel = str(Path(relpath).parent) if Path(relpath).parent != Path() else ""
-        parent_abs = (fixed_dir / parent_rel) if parent_rel else fixed_dir
-        if not parent_abs.is_dir():
-            continue
-        for entry in parent_abs.iterdir():
-            if entry.is_file() and entry.suffix == ".py" and not _is_strict_test_filename(entry.name):
-                sib_rel = (Path(parent_rel) / entry.name).as_posix() if parent_rel else entry.name
-                copy_into_tests(sib_rel)
-            elif entry.is_dir() and entry.name in _FIXTURE_DIRNAMES:
-                sub_rel = (Path(parent_rel) / entry.name).as_posix() if parent_rel else entry.name
-                copy_into_tests(sub_rel)
-
-    # 4. Code-side support (unchanged).
+    # Keep a reference copy of new_code_files; NOT on PYTHONPATH.
+    back_support_root = target_dir / "backported_support"
+    ensure_dir(back_support_root)
     for relpath in new_code_files:
         src = fixed_dir / relpath
         if not src.exists():
             continue
         dst = back_support_root / relpath
         ensure_dir(dst.parent)
-        shutil.copy2(src, dst)
+        shutil.copy(src, dst)
+
+
+def _restore_target(target_dir: Path):
+    """Revert any prior overlay so the next scan iteration sees a clean tree."""
+    if not target_dir.exists() or not (target_dir / ".git").exists():
+        return
+    subprocess.run(
+        ["git", "-C", str(target_dir), "checkout", "HEAD", "--", "."],
+        capture_output=True, text=True, check=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(target_dir), "clean", "-fdx",
+         "-e", ".venv", "-e", "backported_support", "-e", "backported_tests"],
+        capture_output=True, text=True, check=False,
+    )
+    bs = target_dir / "backported_support"
+    if bs.exists():
+        shutil.rmtree(bs, ignore_errors=True)
 
 
 def run_exploit_for_target(
@@ -709,20 +685,17 @@ def run_exploit_for_target(
 
     backport_artifacts(fixed_dir, target_dir, new_test_files, new_code_files)
 
-    backported_test_paths = [
-        str(Path("backported_tests") / rel)
-        for rel in new_test_files
-        if (target_dir / "backported_tests" / rel).exists()
-    ]
-    if not backported_test_paths:
+    overlaid = [rel for rel in new_test_files if (target_dir / rel).exists()]
+    if not overlaid:
         with open(logfile, "w", encoding="utf-8") as f:
-            f.write("[!] No backported regression tests to run.\n")
+            f.write("[!] Overlay failed: none of new_test_files were copied into target.\n")
         return 999
 
-    cmd = f"python -m pytest {tail} {junit_arg} " + " ".join(backported_test_paths)
-    extra_pp = [str(target_dir / "backported_support"), str(target_dir / "backported_tests")]
-
-    cp = run_in_venv(tools_root, cmd, target_dir, logfile, check=False, extra_pythonpath=extra_pp)
+    # Run the overlaid tests from target_dir using target_dir's natural Python
+    # path (cwd + venv site-packages). No extra PYTHONPATH: backported_support
+    # is reference-only.
+    cmd = f"python -m pytest {tail} {junit_arg} " + " ".join(overlaid)
+    cp = run_in_venv(tools_root, cmd, target_dir, logfile, check=False)
     return cp.returncode
 
 
@@ -986,6 +959,9 @@ def _scan_one_cve(args_for_worker) -> Dict[str, object]:
     cve_id = case_dir.name
 
     wipe_all_venvs(case_dir)
+    # Revert any prior overlay before re-running. Safe even on a fresh tree.
+    for sub in ("vulnerable", "fixed"):
+        _restore_target(case_dir / sub)
 
     a, b, c, d, err_msg = _run_full_pipeline_for_cve_with_timeout(tools_root, case_dir, timeout_sec)
 
