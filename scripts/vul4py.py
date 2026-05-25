@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import shlex
 import shutil
 import argparse
 import subprocess
@@ -35,8 +36,9 @@ import platform
 import tarfile
 import urllib.request
 import contextlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from multiprocessing import Pool, cpu_count
 
 # tqdm is OPTIONAL
@@ -549,8 +551,15 @@ def create_and_install(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: P
         run_in_venv(tools_root, cmd, proj_dir, logfile, check=True)
 
 
+def _junit_path_for(logfile: Path) -> Path:
+    return logfile.with_suffix(".junit.xml")
+
+
 def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path) -> int:
     logfile = logs_dir / f"functional_{proj_dir.name}.log"
+    junit = _junit_path_for(logfile)
+    if junit.exists():
+        junit.unlink()
 
     baseline_files = meta.get("baseline_test_files", [])
     existing = [p for p in baseline_files if (proj_dir / p).exists()]
@@ -561,7 +570,7 @@ def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path)
         return 999
 
     base_cmd = meta.get("functional_test_cmd_base", "pytest -q").strip()
-    cmd = base_cmd + " " + " ".join(existing)
+    cmd = f"{base_cmd} --junitxml={shlex.quote(str(junit))} " + " ".join(existing)
     cp = run_in_venv(tools_root, cmd, proj_dir, logfile, check=False)
     return cp.returncode
 
@@ -603,7 +612,10 @@ def run_exploit_for_target(
     logs_dir: Path,
 ) -> int:
     logfile = logs_dir / f"exploit_{version_name}.log"
+    junit = _junit_path_for(logfile)
     ensure_dir(logfile.parent)
+    if junit.exists():
+        junit.unlink()
 
     new_test_files = meta.get("new_test_files", [])
     new_code_files = meta.get("new_code_files", [])
@@ -619,13 +631,15 @@ def run_exploit_for_target(
     else:
         tail = base_cmd
 
+    junit_arg = f"--junitxml={shlex.quote(str(junit))}"
+
     if version_name == "fixed":
         existing = [p for p in new_test_files if (fixed_dir / p).exists()]
         if not existing:
             with open(logfile, "w", encoding="utf-8") as f:
                 f.write("[!] No regression tests exist in fixed dir.\n")
             return 999
-        cmd = f"python -m pytest {tail} " + " ".join(existing)
+        cmd = f"python -m pytest {tail} {junit_arg} " + " ".join(existing)
         cp = run_in_venv(tools_root, cmd, fixed_dir, logfile, check=False)
         return cp.returncode
 
@@ -641,7 +655,7 @@ def run_exploit_for_target(
             f.write("[!] No backported regression tests to run.\n")
         return 999
 
-    cmd = f"python -m pytest {tail} " + " ".join(backported_test_paths)
+    cmd = f"python -m pytest {tail} {junit_arg} " + " ".join(backported_test_paths)
     extra_pp = [str(target_dir / "backported_support"), str(target_dir / "backported_tests")]
 
     cp = run_in_venv(tools_root, cmd, target_dir, logfile, check=False, extra_pythonpath=extra_pp)
@@ -801,6 +815,8 @@ def _rc_is_timeout(rc: int) -> bool:
     return rc == -2
 
 
+# --- rc-based verdicts (FALLBACK; used only when junit XML is unavailable) ---
+
 def _functional_ok(rc: int) -> bool:
     return rc in (0, 999)
 
@@ -815,6 +831,90 @@ def _exploit_expected_fixed(rc: int) -> bool:
     return rc == 0
 
 
+# --- junit-based verdicts (PRIMARY; structured pass/fail/error counts) ---
+
+def _parse_junit(path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Parse a pytest --junitxml file. Returns:
+        {"tests","passed","failed","errored","skipped","failed_cases": [...]}
+    or None if the file does not exist or is malformed (treated as
+    "infrastructure-broken" by callers).
+    """
+    if not path.exists():
+        return None
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return None
+    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    tests = failures = errors = skipped = 0
+    failed_cases: List[Dict[str, str]] = []
+    for s in suites:
+        tests += int(s.get("tests", 0) or 0)
+        failures += int(s.get("failures", 0) or 0)
+        errors += int(s.get("errors", 0) or 0)
+        skipped += int(s.get("skipped", 0) or 0)
+        for c in s.findall("testcase"):
+            if c.find("failure") is not None or c.find("error") is not None:
+                failed_cases.append(
+                    {
+                        "classname": c.get("classname", "") or "",
+                        "name": c.get("name", "") or "",
+                        "file": c.get("file", "") or "",
+                    }
+                )
+    return {
+        "tests": tests,
+        "passed": max(0, tests - failures - errors - skipped),
+        "failed": failures,
+        "errored": errors,
+        "skipped": skipped,
+        "failed_cases": failed_cases,
+    }
+
+
+def _functional_ok_struct(res: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if res is None:
+        return None
+    return res["failed"] == 0 and res["errored"] == 0
+
+
+def _exploit_caught_vuln_struct(res: Optional[Dict[str, Any]], new_test_files: List[str]) -> Optional[bool]:
+    """
+    True iff at least one failed test case came from a file listed in
+    new_test_files (matched by basename in c['file'] or by stem in c['classname']).
+    """
+    if res is None:
+        return None
+    if not res["failed_cases"]:
+        return False
+    new_files_norm = [p.replace("\\", "/") for p in new_test_files]
+    new_stems = {os.path.basename(p).rsplit(".", 1)[0] for p in new_files_norm if p}
+    for c in res["failed_cases"]:
+        f = (c.get("file") or "").replace("\\", "/")
+        if f and any(f.endswith(n) for n in new_files_norm):
+            return True
+        cls = c.get("classname") or ""
+        if any(stem and stem in cls for stem in new_stems):
+            return True
+    return False
+
+
+def _exploit_passes_fixed_struct(res: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if res is None:
+        return None
+    return res["failed"] == 0 and res["errored"] == 0 and res["passed"] >= 1
+
+
+def _infra_broken(rc: int, res: Optional[Dict[str, Any]]) -> bool:
+    """A run is 'infra broken' if pytest didn't produce a junit AND rc isn't a
+    sentinel we already understand (0=clean pass, 999=no tests, -1=exception,
+    -2=timeout). That covers collection errors, plugin failures, usage errors."""
+    if res is not None:
+        return False
+    return rc not in (0, 999, -1, -2)
+
+
 def _scan_one_cve(args_for_worker) -> Dict[str, object]:
     case_dir_str, timeout_sec, tools_root_str = args_for_worker
     tools_root = Path(tools_root_str).resolve()
@@ -825,19 +925,64 @@ def _scan_one_cve(args_for_worker) -> Dict[str, object]:
 
     a, b, c, d, err_msg = _run_full_pipeline_for_cve_with_timeout(tools_root, case_dir, timeout_sec)
 
+    logs_dir = case_dir / "logs"
+    fv = _parse_junit(logs_dir / "functional_vulnerable.junit.xml")
+    ff = _parse_junit(logs_dir / "functional_fixed.junit.xml")
+    ev = _parse_junit(logs_dir / "exploit_vulnerable.junit.xml")
+    ef = _parse_junit(logs_dir / "exploit_fixed.junit.xml")
+
+    new_test_files: List[str] = []
+    try:
+        new_test_files = load_meta(case_dir).get("new_test_files", [])
+    except Exception:
+        pass
+
+    # Per-run verdicts: prefer junit struct, fall back to rc.
+    def _per_run(struct_v: Optional[bool], rc_v: bool) -> Tuple[bool, str]:
+        if struct_v is None:
+            return rc_v, "rc"
+        return struct_v, "struct"
+
+    fv_ok, fv_src = _per_run(_functional_ok_struct(fv), _functional_ok(a))
+    ff_ok, ff_src = _per_run(_functional_ok_struct(ff), _functional_ok(b))
+    ev_caught, ev_src = _per_run(_exploit_caught_vuln_struct(ev, new_test_files), _exploit_expected_vulnerable(c))
+    ef_ok, ef_src = _per_run(_exploit_passes_fixed_struct(ef), _exploit_expected_fixed(d))
+
+    infra = [
+        _infra_broken(a, fv),
+        _infra_broken(b, ff),
+        _infra_broken(c, ev),
+        _infra_broken(d, ef),
+    ]
+
     if any(_rc_is_timeout(x) for x in (a, b, c, d)):
         status = "TIMEOUT"
+    elif any(infra):
+        status = "INFRA_BROKEN"
+    elif fv_ok and ff_ok and ev_caught and ef_ok:
+        status = "OK"
     else:
-        expected_ok = _functional_ok(a) and _functional_ok(b) and _exploit_expected_vulnerable(c) and _exploit_expected_fixed(d)
-        status = "OK" if expected_ok else "UNEXPECTED"
+        status = "UNEXPECTED"
+
+    verdict_src = "+".join([fv_src, ff_src, ev_src, ef_src])  # e.g. "struct+struct+rc+struct"
+
+    def _pf(res: Optional[Dict[str, Any]]) -> str:
+        if res is None:
+            return "-"
+        return f"{res['passed']}/{res['failed']}/{res['errored']}/{res['skipped']}"
 
     return {
         "cve_id": cve_id,
+        "status": status,
+        "verdict_src": verdict_src,
         "func_vuln_rc": a,
         "func_fixed_rc": b,
         "exploit_vuln_rc": c,
         "exploit_fixed_rc": d,
-        "status": status,
+        "fv_pfes": _pf(fv),
+        "ff_pfes": _pf(ff),
+        "ev_pfes": _pf(ev),
+        "ef_pfes": _pf(ef),
         "error": err_msg,
     }
 
@@ -986,19 +1131,18 @@ def subcmd_scan(args):
         pool.join()
 
     out_path = ws_root / "scan_report.tsv"
+    cols = [
+        "cve_id", "status", "verdict_src",
+        "func_vuln_rc", "func_fixed_rc", "exploit_vuln_rc", "exploit_fixed_rc",
+        "fv_pfes", "ff_pfes", "ev_pfes", "ef_pfes",
+    ]
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("cve_id\tfunc_vuln_rc\tfunc_fixed_rc\texploit_vuln_rc\texploit_fixed_rc\tstatus\n")
+        f.write("\t".join(cols) + "\n")
         for r in results:
-            f.write(
-                f"{r['cve_id']}\t"
-                f"{r['func_vuln_rc']}\t"
-                f"{r['func_fixed_rc']}\t"
-                f"{r['exploit_vuln_rc']}\t"
-                f"{r['exploit_fixed_rc']}\t"
-                f"{r['status']}\n"
-            )
+            f.write("\t".join(str(r.get(c, "")) for c in cols) + "\n")
 
     print(f"[+] Scan complete. Report written to {out_path}")
+    print("    pfes columns are passed/failed/errored/skipped per run; '-' means junit was not produced (rc-based fallback in effect).")
 
 
 # ---------- main ----------
