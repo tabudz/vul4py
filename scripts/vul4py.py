@@ -575,25 +575,89 @@ def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path)
     return cp.returncode
 
 
+_FIXTURE_DIRNAMES = {"data", "fixtures", "test_data", "testdata", "samples", "snapshots"}
+
+
+def _is_strict_test_filename(name: str) -> bool:
+    """A file whose own name says 'I am a pytest test module'."""
+    if not name.endswith(".py"):
+        return False
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
 def backport_artifacts(
     fixed_dir: Path,
     target_dir: Path,
     new_test_files: List[str],
     new_code_files: List[str],
 ):
+    """
+    Bring artifacts from fixed_dir into target_dir so the regression tests can
+    run against target_dir's (vulnerable) source.
+
+    Beyond the headline new_test_files / new_code_files, we also copy:
+      - every __init__.py from the repo root down to each test's parent
+        (so package-relative imports resolve)
+      - every NON-test .py sibling of each test file (conftest.py, helper
+        modules like tz_stub.py)
+      - any data/fixtures-style sibling subdirectory (parametrised tests
+        commonly listdir() these at import time)
+
+    These extras are written under backported_tests/ alongside the test
+    itself so pytest sees a self-contained tree.
+    """
     back_tests_root = target_dir / "backported_tests"
     back_support_root = target_dir / "backported_support"
     ensure_dir(back_tests_root)
     ensure_dir(back_support_root)
 
-    for relpath in new_test_files:
-        src = fixed_dir / relpath
-        if not src.exists():
-            continue
-        dst = back_tests_root / relpath
-        ensure_dir(dst.parent)
-        shutil.copy2(src, dst)
+    seen: set = set()
 
+    def copy_into_tests(rel: str):
+        if not rel or rel in seen:
+            return
+        src = fixed_dir / rel
+        if not src.exists():
+            return
+        dst = back_tests_root / rel
+        ensure_dir(dst.parent)
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+        seen.add(rel)
+
+    # 1. The new test files themselves.
+    for relpath in new_test_files:
+        copy_into_tests(relpath)
+
+    # 2. Package skeleton: copy __init__.py from each ancestor dir of every
+    #    new test file (if it exists in the fixed checkout).
+    for relpath in new_test_files:
+        parts = Path(relpath).parts
+        for i in range(1, len(parts)):
+            anc = Path(*parts[:i])
+            init_rel = str(anc / "__init__.py")
+            if (fixed_dir / init_rel).is_file():
+                copy_into_tests(init_rel)
+
+    # 3. Siblings of each new test file:
+    #     - non-test .py files in the same dir (conftest.py, tz_stub.py, ...)
+    #     - data/fixtures-style subdirs in the same dir
+    for relpath in new_test_files:
+        parent_rel = str(Path(relpath).parent) if Path(relpath).parent != Path() else ""
+        parent_abs = (fixed_dir / parent_rel) if parent_rel else fixed_dir
+        if not parent_abs.is_dir():
+            continue
+        for entry in parent_abs.iterdir():
+            if entry.is_file() and entry.suffix == ".py" and not _is_strict_test_filename(entry.name):
+                sib_rel = (Path(parent_rel) / entry.name).as_posix() if parent_rel else entry.name
+                copy_into_tests(sib_rel)
+            elif entry.is_dir() and entry.name in _FIXTURE_DIRNAMES:
+                sub_rel = (Path(parent_rel) / entry.name).as_posix() if parent_rel else entry.name
+                copy_into_tests(sub_rel)
+
+    # 4. Code-side support (unchanged).
     for relpath in new_code_files:
         src = fixed_dir / relpath
         if not src.exists():
@@ -961,6 +1025,13 @@ def _scan_one_cve(args_for_worker) -> Dict[str, object]:
         status = "INFRA_BROKEN"
     elif fv_ok and ff_ok and ev_caught and ef_ok:
         status = "OK"
+    elif fv_ok and ff_ok and (not ev_caught) and ef_ok:
+        # Baseline clean on both sides; exploit cleanly passes on fixed; but the
+        # exact same exploit test also passes on vulnerable (no failure tied to
+        # a new_test_file). The upstream regression test does not differentiate
+        # vulnerable from fixed -- meta is fine, fix is fine, but this CVE
+        # needs a hand-written PoC to be a real oracle.
+        status = "NON_ORACLE"
     else:
         status = "UNEXPECTED"
 
