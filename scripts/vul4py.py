@@ -1118,6 +1118,23 @@ def subcmd_scan(args):
     # Ensure tools root exists early
     ensure_dir(args.tools_root)
 
+    # Prewarm: serially provision every Python version + the compiler env BEFORE
+    # spawning workers. Without this, multiple workers race on the same
+    # conda/micromamba env directory; on this host the file lock occasionally
+    # fails and a worker raises mid-create, returning rc=-1 for that CVE.
+    py_versions = set()
+    for c in cve_dirs:
+        try:
+            v = str(load_meta(Path(c)).get("python_version", "")).strip()
+            if v:
+                py_versions.add(v)
+        except Exception:
+            pass
+    print(f"[+] Prewarming compiler env + python interpreters: {sorted(py_versions)}")
+    ensure_compiler_paths(args.tools_root)
+    for v in sorted(py_versions):
+        ensure_python_interpreter(args.tools_root, v)
+
     # Workers need to see the same tools root; pass as string
     worker_args = [(c, timeout_sec, str(args.tools_root)) for c in cve_dirs]
 
