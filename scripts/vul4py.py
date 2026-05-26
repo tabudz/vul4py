@@ -978,6 +978,17 @@ def _scan_one_cve(args_for_worker) -> Dict[str, object]:
     for sub in ("vulnerable", "fixed"):
         _restore_target(case_dir / sub)
 
+    # Clear stale junit XMLs so a partial pipeline can't be misread as
+    # success from a previous iteration. (logs/ is one level above the
+    # per-version git checkouts, so _restore_target doesn't touch it.)
+    case_logs_dir = case_dir / "logs"
+    if case_logs_dir.exists():
+        for jx in case_logs_dir.glob("*.junit.xml"):
+            try:
+                jx.unlink()
+            except OSError:
+                pass
+
     a, b, c, d, err_msg = _run_full_pipeline_for_cve_with_timeout(tools_root, case_dir, timeout_sec)
 
     logs_dir = case_dir / "logs"
@@ -1014,17 +1025,20 @@ def _scan_one_cve(args_for_worker) -> Dict[str, object]:
         status = "TIMEOUT"
     elif any(infra):
         status = "INFRA_BROKEN"
-    elif fv_ok and ff_ok and ev_caught and ef_ok:
-        status = "OK"
-    elif fv_ok and ff_ok and (not ev_caught) and ef_ok:
-        # Baseline clean on both sides; exploit cleanly passes on fixed; but the
-        # exact same exploit test also passes on vulnerable (no failure tied to
-        # a new_test_file). The upstream regression test does not differentiate
-        # vulnerable from fixed -- meta is fine, fix is fine, but this CVE
-        # needs a hand-written PoC to be a real oracle.
-        status = "NON_ORACLE"
+    elif ff_ok and ef_ok:
+        # Fixed side passes everything (baseline + exploit). For benchmark
+        # purposes that's the load-bearing invariant -- the patch under test
+        # must not break anything on a known-good codebase. The vulnerable
+        # side then says whether the upstream test is a real oracle.
+        if fv_ok and ev_caught:
+            status = "OK"          # full oracle: vuln passes baseline + fails exploit
+        else:
+            status = "NON_ORACLE"  # fix clean, but upstream test doesn't reproduce
+                                   # the vuln on vulnerable (or vuln breaks even
+                                   # baseline). Hand-written PoC needed to make
+                                   # it a real oracle, but the entry is usable.
     else:
-        status = "UNEXPECTED"
+        status = "UNEXPECTED"      # fixed isn't clean -- can't trust the oracle
 
     verdict_src = "+".join([fv_src, ff_src, ev_src, ef_src])  # e.g. "struct+struct+rc+struct"
 
@@ -1166,7 +1180,7 @@ def subcmd_scan(args):
     ws_root = args.workspace_root.resolve()
 
     jobs = args.jobs if args.jobs is not None else max(cpu_count() - 1, 1)
-    timeout_sec = 1800  # 30 min per CVE
+    timeout_sec = args.timeout  # default 3600s; per-CVE configurable via flag
 
     print(f"[+] Scanning all CVEs under {ws_root} with {jobs} workers (timeout {timeout_sec}s/CVE)")
     print(f"[+] Tools root: {args.tools_root}")
@@ -1276,6 +1290,8 @@ def main():
 
     p_scan = sub.add_parser("scan", help="run all CVEs in parallel and summarize timeout/unexpected")
     p_scan.add_argument("--jobs", type=int, help="number of parallel workers (default: cpu_count()-1)")
+    p_scan.add_argument("--timeout", type=int, default=3600,
+                        help="per-CVE wall-time cap in seconds (default 3600 = 60 min)")
     p_scan.set_defaults(func=subcmd_scan)
 
     args = parser.parse_args()

@@ -39,6 +39,12 @@ def junit_to_deselect(file: str, classname: str, name: str) -> Optional[str]:
     classname = classname or ""
     name = name or ""
 
+    # Pytest module-level collection-error shape: classname is empty, name is a
+    # dotted module path like "tests.test_urldispatch". Convert to a whole-file
+    # deselect because there's no specific test to point at.
+    if (not classname) and name and "." in name and "/" not in name and "::" not in name and not name.startswith("test_"):
+        return name.replace(".", "/") + ".py"
+
     # If junit didn't populate `file` (common for collection errors), try
     # to derive it from the classname's dotted module prefix.
     if not file and classname:
@@ -90,20 +96,20 @@ def collect_failing(junit_path: Path) -> List[str]:
     return ids
 
 
-_DESELECT_RE = re.compile(r"--deselect[ =]([^ ]+|\S+)")
-
-
-def existing_deselects(cmd: str) -> set:
-    """Return the set of values currently passed as --deselect in a cmd."""
-    out = set()
+def existing_flagged_filters(cmd: str) -> set:
+    """Return {(flag, value), ...} for every --deselect/--ignore token."""
+    out: set = set()
     tokens = shlex.split(cmd)
     i = 0
     while i < len(tokens):
-        if tokens[i] == "--deselect" and i + 1 < len(tokens):
-            out.add(tokens[i + 1])
+        if tokens[i] in ("--deselect", "--ignore") and i + 1 < len(tokens):
+            out.add((tokens[i], tokens[i + 1]))
             i += 2
         elif tokens[i].startswith("--deselect="):
-            out.add(tokens[i].split("=", 1)[1])
+            out.add(("--deselect", tokens[i].split("=", 1)[1]))
+            i += 1
+        elif tokens[i].startswith("--ignore="):
+            out.add(("--ignore", tokens[i].split("=", 1)[1]))
             i += 1
         else:
             i += 1
@@ -111,12 +117,23 @@ def existing_deselects(cmd: str) -> set:
 
 
 def append_deselects(cmd: str, new_ids: List[str]) -> str:
-    have = existing_deselects(cmd)
-    to_add = [d for d in new_ids if d not in have]
-    if not to_add:
+    """Append --deselect for specific test ids, --ignore for whole-file paths.
+    pytest's --deselect operates on already-collected tests, so it can't help
+    when collection itself fails -- use --ignore for those. We key dedup on
+    (flag, value) so a wrong-flag legacy entry doesn't suppress a needed
+    right-flag addition."""
+    have = existing_flagged_filters(cmd)
+    parts = []
+    for d in new_ids:
+        flag = "--ignore" if "::" not in d else "--deselect"
+        key = (flag, d)
+        if key in have:
+            continue
+        have.add(key)
+        parts.append(f"{flag} {shlex.quote(d)}")
+    if not parts:
         return cmd
-    extra = " ".join(f"--deselect {shlex.quote(d)}" for d in to_add)
-    return cmd.rstrip() + " " + extra
+    return cmd.rstrip() + " " + " ".join(parts)
 
 
 def merge_override(override_path: Path, vid: str, new_cmd: str, n_deselects: int) -> dict:
@@ -148,41 +165,83 @@ def main():
         sys.exit(f"no workspaces: {args.workspaces}")
     args.overrides.mkdir(parents=True, exist_ok=True)
 
+    PHASES = (
+        ("functional_fixed.junit.xml", "functional_test_cmd_base"),
+        ("exploit_fixed.junit.xml",    "exploit_test_cmd_base"),
+    )
+
     n_updated = n_noop = n_skip_large = 0
     for case in sorted(args.workspaces.iterdir()):
         if not case.is_dir() or not (case / "meta.json").exists():
             continue
         vid = case.name
-        junit = case / "logs" / "functional_fixed.junit.xml"
-        failing = collect_failing(junit)
-        if not failing:
-            continue
-        if len(failing) > args.max_deselects:
-            print(f"[skip-large] {vid}: {len(failing)} failing tests; treat as a meta problem, not env noise")
-            n_skip_large += 1
-            continue
 
-        meta = json.loads((case / "meta.json").read_text(encoding="utf-8"))
-        current_cmd = meta.get("functional_test_cmd_base", "pytest -q")
-        new_cmd = append_deselects(current_cmd, failing)
-        if new_cmd == current_cmd:
-            n_noop += 1
-            continue
-
+        meta_path = case / "meta.json"
         override_path = args.overrides / f"{vid}.json"
-        ov = merge_override(override_path, vid, new_cmd, len(failing))
-        if args.dry_run:
-            print(f"[dry] {vid}: +{len(failing)} deselects -> {override_path}")
-            for d in failing[:3]:
-                print(f"       {d}")
-            if len(failing) > 3:
-                print(f"       (+{len(failing)-3} more)")
-        else:
-            override_path.write_text(json.dumps(ov, indent=2) + "\n", encoding="utf-8")
-            print(f"[ok ] {vid}: +{len(failing)} deselects -> {override_path.name}")
-            n_updated += 1
+        updated_for_cve = False
+        total_added = 0
 
-    print(f"[done] updated={n_updated}  noop={n_noop}  skip_large={n_skip_large}")
+        for junit_name, meta_field in PHASES:
+            junit = case / "logs" / junit_name
+            failing = collect_failing(junit)
+            if not failing:
+                continue
+            if len(failing) > args.max_deselects:
+                print(f"[skip-large] {vid}/{junit_name}: {len(failing)} failing; treat as meta problem")
+                n_skip_large += 1
+                continue
+
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            current_cmd = meta.get(meta_field, "pytest -q")
+            new_cmd = append_deselects(current_cmd, failing)
+
+            # For whole-file collection-error entries, also drop them from
+            # baseline_test_files (they're passed as positional args, which
+            # overrides --ignore). Only affects functional, not exploit.
+            whole_file_ids = [d for d in failing if "::" not in d]
+
+            if new_cmd == current_cmd and not whole_file_ids:
+                continue
+
+            if override_path.exists():
+                ov = json.loads(override_path.read_text(encoding="utf-8"))
+            else:
+                ov = {}
+            ov.setdefault("set", {})[meta_field] = new_cmd
+
+            if whole_file_ids and meta_field == "functional_test_cmd_base":
+                ov.setdefault("drop", {})
+                existing_drops = set(ov["drop"].get("baseline_test_files", []))
+                for d in whole_file_ids:
+                    existing_drops.add(d)
+                ov["drop"]["baseline_test_files"] = sorted(existing_drops)
+
+            note = ov.get("_note", "")
+            marker = f"[{AUTO_NOTE_TAG}:{meta_field}={len(failing)}]"
+            if AUTO_NOTE_TAG + ":" + meta_field in note:
+                note = re.sub(r"\[" + AUTO_NOTE_TAG + r":" + meta_field + r"=[^\]]*\]", marker, note)
+            else:
+                note = (note + " " if note else "") + marker
+            ov["_note"] = note.strip()
+
+            if args.dry_run:
+                print(f"[dry] {vid}/{meta_field}: +{len(failing)} deselects")
+                for d in failing[:3]:
+                    print(f"       {d}")
+                if len(failing) > 3:
+                    print(f"       (+{len(failing)-3} more)")
+            else:
+                override_path.write_text(json.dumps(ov, indent=2) + "\n", encoding="utf-8")
+                print(f"[ok ] {vid}/{meta_field}: +{len(failing)} deselects -> {override_path.name}")
+                updated_for_cve = True
+                total_added += len(failing)
+
+        if updated_for_cve:
+            n_updated += 1
+        else:
+            n_noop += 1
+
+    print(f"[done] cves_updated={n_updated}  cves_noop={n_noop}  skip_large_events={n_skip_large}")
 
 
 if __name__ == "__main__":

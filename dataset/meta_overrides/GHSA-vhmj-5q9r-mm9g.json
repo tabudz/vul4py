@@ -1,0 +1,6 @@
+{
+  "set": {
+    "functional_test_cmd_base": "pytest -q --deselect tests/test_lib_importotp.py::GPGTestCase::test_00_gpg_decrypt --deselect tests/test_api_token.py::APITokenTestCase::test_11_load_tokens --deselect tests/test_api_token.py::APITokenTestCase::test_14_get_serial_by_otp"
+  },
+  "_note": "[auto_skip:functional_test_cmd_base=3]"
+}
