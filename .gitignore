@@ -7,6 +7,11 @@ workspaces/scan_report.tsv
 # agent outputs (re-creatable from prompts + scripts/run_agent.py)
 runs/*/
 
+# paper-experiment scripts kept out of the public release
+scripts/stage_appatch.py
+scripts/build_review.py
+scripts/openrouter_balance.py
+
 # python
 __pycache__/
 *.pyc

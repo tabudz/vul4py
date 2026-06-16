@@ -128,12 +128,18 @@ def call_claude(system: str, prompt: str, model: str) -> tuple:
     return text, meta
 
 
-def call_gpt(system: str, prompt: str, model: str) -> tuple:
+def call_gpt(system: str, prompt: str, model: str, temperature: float = 0.0) -> tuple:
     from openai import OpenAI  # lazy
-    client = OpenAI()
+    # Route through OpenRouter when OPENROUTER_API_KEY is set; otherwise use the
+    # stock OpenAI endpoint. OPENAI_BASE_URL overrides the endpoint explicitly.
+    or_key = os.environ.get("OPENROUTER_API_KEY")
+    base_url = os.environ.get("OPENAI_BASE_URL") or ("https://openrouter.ai/api/v1" if or_key else None)
+    api_key = or_key or os.environ.get("OPENAI_API_KEY")
+    client = OpenAI(base_url=base_url, api_key=api_key) if base_url else OpenAI()
     t0 = time.time()
     resp = client.chat.completions.create(
         model=model,
+        temperature=temperature,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -144,6 +150,7 @@ def call_gpt(system: str, prompt: str, model: str) -> tuple:
     usage = resp.usage
     meta = {
         "model": model,
+        "provider": "openrouter" if base_url and "openrouter" in base_url else "openai",
         "input_tokens": getattr(usage, "prompt_tokens", None),
         "output_tokens": getattr(usage, "completion_tokens", None),
         "stop_reason": resp.choices[0].finish_reason,
@@ -169,7 +176,8 @@ def extract_diff(text: str) -> str:
 
 # ---------- driver ----------
 
-def run_builtin(agent: str, model: str, vuln_id: str, case_dir: Path, out_dir: Path) -> int:
+def run_builtin(agent: str, model: str, vuln_id: str, case_dir: Path, out_dir: Path,
+                temperature: float = 0.0) -> int:
     meta = load_meta(case_dir)
     files = collect_context_files(case_dir, meta)
     user = build_user_prompt(vuln_id, meta, files)
@@ -181,7 +189,7 @@ def run_builtin(agent: str, model: str, vuln_id: str, case_dir: Path, out_dir: P
         if agent == "claude":
             text, info = call_claude(SYSTEM_PROMPT, user, model)
         else:
-            text, info = call_gpt(SYSTEM_PROMPT, user, model)
+            text, info = call_gpt(SYSTEM_PROMPT, user, model, temperature=temperature)
     except Exception as e:
         (out_dir / "generation.json").write_text(
             json.dumps({"agent": agent, "model": model, "error": repr(e)}, indent=2),
@@ -221,6 +229,8 @@ def main():
     ap.add_argument("--workspaces", type=Path, default=WORKSPACES)
     ap.add_argument("--runs", type=Path, default=RUNS)
     ap.add_argument("--limit", type=int, default=None, help="Cap how many vulns to process")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="Sampling temperature for the gpt builtin (default 0, paper-consistent)")
     args = ap.parse_args()
 
     model = args.model
@@ -252,7 +262,7 @@ def main():
             continue
 
         if args.agent in BUILTIN:
-            rc = run_builtin(args.agent, model, vid, case_dir, out_dir)
+            rc = run_builtin(args.agent, model, vid, case_dir, out_dir, temperature=args.temperature)
         else:
             rc = verify_external(args.agent, vid, out_dir)
 

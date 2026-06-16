@@ -49,6 +49,12 @@ except Exception:
         return it
 
 
+# Wall-clock cap (seconds) for a single functional/exploit pytest invocation.
+# Guards against hang-prone suites (e.g. waitress async-socket tests) wedging
+# the run_eval Pool forever. Tunable without code changes via env var.
+DEFAULT_TEST_TIMEOUT = int(os.environ.get("VUL4PY_TEST_TIMEOUT", "900"))
+
+
 # ---------- basic helpers ----------
 
 def ensure_dir(p: Path):
@@ -63,6 +69,77 @@ def _require_cmd(cmd: str, hint: str = "") -> str:
     if hint:
         msg += f"\nHint: {hint}"
     raise RuntimeError(msg)
+
+
+_TEST_OVERRIDES_DIR = Path(__file__).resolve().parent.parent / "dataset" / "test_overrides"
+
+
+def apply_test_overrides(target_dir: Path, vid: str, relpaths: List[str]) -> List[str]:
+    """Install per-CVE test overrides into target_dir.
+
+    Looks under dataset/test_overrides/<vid>/ for two forms:
+      <relpath>          full-file replacement copied over target
+      <relpath>.patch    unified diff applied via `git apply` to target_dir
+
+    Also installs any additional files in the override dir not listed in
+    relpaths (e.g. a conftest.py needed for the new tests to import on
+    revisions that predate a referenced symbol). `.patch` files are
+    applied, all other files are copied to target_dir at the same
+    relative path.
+
+    Overrides are applied on both the fixed and the overlaid vulnerable
+    runs so the same test set executes on either revision. Returns the
+    list of paths actually patched/copied (for logging).
+    """
+    src_root = _TEST_OVERRIDES_DIR / vid
+    if not src_root.exists():
+        return []
+    applied: List[str] = []
+    handled: set = set()
+    for relpath in relpaths:
+        repl = src_root / relpath
+        patch = src_root / (relpath + ".patch")
+        if repl.exists():
+            dst = target_dir / relpath
+            ensure_dir(dst.parent)
+            shutil.copy(repl, dst)
+            applied.append(relpath)
+            handled.add(repl.resolve())
+        elif patch.exists():
+            cp = subprocess.run(
+                ["git", "apply", str(patch)],
+                cwd=str(target_dir), capture_output=True, text=True, check=False,
+            )
+            if cp.returncode != 0:
+                subprocess.run(
+                    ["patch", "-p1", "-i", str(patch)],
+                    cwd=str(target_dir), capture_output=True, text=True, check=False,
+                )
+            applied.append(relpath)
+            handled.add(patch.resolve())
+    # Sweep up any extras (e.g. conftest.py) not tied to a new_test_files entry.
+    for src in src_root.rglob("*"):
+        if not src.is_file() or src.resolve() in handled:
+            continue
+        rel = src.relative_to(src_root)
+        if str(rel).endswith(".patch"):
+            target_rel = str(rel)[:-len(".patch")]
+            cp = subprocess.run(
+                ["git", "apply", str(src)],
+                cwd=str(target_dir), capture_output=True, text=True, check=False,
+            )
+            if cp.returncode != 0:
+                subprocess.run(
+                    ["patch", "-p1", "-i", str(src)],
+                    cwd=str(target_dir), capture_output=True, text=True, check=False,
+                )
+            applied.append(target_rel)
+        else:
+            dst = target_dir / rel
+            ensure_dir(dst.parent)
+            shutil.copy(src, dst)
+            applied.append(str(rel))
+    return applied
 
 
 def load_meta(case_dir: Path) -> Dict:
@@ -427,10 +504,16 @@ def run_in_venv(
     logfile: Path,
     check: bool,
     extra_pythonpath: Optional[List[str]] = None,
+    timeout: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
     """
     Run `cmd` inside proj_dir's .venv, capturing stdout/stderr into logfile.
     Also wires compiler env (if any) into PATH/LD_LIBRARY_PATH.
+
+    If `timeout` (seconds) is given and elapses, the entire process group is
+    killed (not just the shell) so pytest workers can't survive as orphans,
+    and the returned CompletedProcess has returncode 124 (GNU `timeout`
+    convention). `timeout=None` (default) runs unbounded -- used for installs.
     """
     proj_dir = proj_dir.resolve()
     logfile = logfile.resolve()
@@ -476,17 +559,42 @@ def run_in_venv(
         "echo GCC_BIN=$(which gcc || true); "
     )
 
-    cp = subprocess.run(
+    timed_out = False
+    # start_new_session=True puts the shell + all its descendants (pytest and
+    # its forked workers) into a fresh process group, so on timeout we can kill
+    # the whole tree via the group rather than leaking orphaned test runners.
+    proc = subprocess.Popen(
         debug_prefix + cmd,
         shell=True,
         cwd=str(proj_dir),
         env=env,
         text=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(pgid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+        returncode = 124  # GNU timeout convention
+
+    cp = subprocess.CompletedProcess(
+        args=cmd, returncode=returncode, stdout=stdout, stderr=stderr
     )
 
     with open(logfile, "w", encoding="utf-8") as f:
         f.write(f"$ {cmd}\n")
+        if timed_out:
+            f.write(f"[TIMEOUT after {timeout}s -- process group killed]\n")
         f.write(f"[exit {cp.returncode}]\n\n")
         f.write("STDOUT:\n")
         f.write(cp.stdout or "")
@@ -555,7 +663,8 @@ def _junit_path_for(logfile: Path) -> Path:
     return logfile.with_suffix(".junit.xml")
 
 
-def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path) -> int:
+def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path,
+                   timeout: Optional[int] = DEFAULT_TEST_TIMEOUT) -> int:
     logfile = logs_dir / f"functional_{proj_dir.name}.log"
     junit = _junit_path_for(logfile)
     if junit.exists():
@@ -571,7 +680,7 @@ def run_functional(tools_root: Path, proj_dir: Path, meta: Dict, logs_dir: Path)
 
     base_cmd = meta.get("functional_test_cmd_base", "pytest -q").strip()
     cmd = f"{base_cmd} --junitxml={shlex.quote(str(junit))} " + " ".join(existing)
-    cp = run_in_venv(tools_root, cmd, proj_dir, logfile, check=False)
+    cp = run_in_venv(tools_root, cmd, proj_dir, logfile, check=False, timeout=timeout)
     return cp.returncode
 
 
@@ -650,6 +759,7 @@ def run_exploit_for_target(
     version_name: str,
     meta: Dict,
     logs_dir: Path,
+    timeout: Optional[int] = DEFAULT_TEST_TIMEOUT,
 ) -> int:
     logfile = logs_dir / f"exploit_{version_name}.log"
     junit = _junit_path_for(logfile)
@@ -673,17 +783,24 @@ def run_exploit_for_target(
 
     junit_arg = f"--junitxml={shlex.quote(str(junit))}"
 
+    vid = fixed_dir.parent.name
+
     if version_name == "fixed":
+        # Apply overrides first so any new_test_files entry that's defined only
+        # in dataset/test_overrides is written to fixed_dir before the
+        # `path exists` filter runs.
+        apply_test_overrides(fixed_dir, vid, new_test_files)
         existing = [p for p in new_test_files if (fixed_dir / p).exists()]
         if not existing:
             with open(logfile, "w", encoding="utf-8") as f:
                 f.write("[!] No regression tests exist in fixed dir.\n")
             return 999
         cmd = f"python -m pytest {tail} {junit_arg} " + " ".join(existing)
-        cp = run_in_venv(tools_root, cmd, fixed_dir, logfile, check=False)
+        cp = run_in_venv(tools_root, cmd, fixed_dir, logfile, check=False, timeout=timeout)
         return cp.returncode
 
     backport_artifacts(fixed_dir, target_dir, new_test_files, new_code_files)
+    apply_test_overrides(target_dir, vid, new_test_files)
 
     overlaid = [rel for rel in new_test_files if (target_dir / rel).exists()]
     if not overlaid:
@@ -695,7 +812,7 @@ def run_exploit_for_target(
     # path (cwd + venv site-packages). No extra PYTHONPATH: backported_support
     # is reference-only.
     cmd = f"python -m pytest {tail} {junit_arg} " + " ".join(overlaid)
-    cp = run_in_venv(tools_root, cmd, target_dir, logfile, check=False)
+    cp = run_in_venv(tools_root, cmd, target_dir, logfile, check=False, timeout=timeout)
     return cp.returncode
 
 
@@ -1185,9 +1302,12 @@ def subcmd_scan(args):
     print(f"[+] Scanning all CVEs under {ws_root} with {jobs} workers (timeout {timeout_sec}s/CVE)")
     print(f"[+] Tools root: {args.tools_root}")
 
+    only = set(s.strip() for s in (args.only or "").split(",") if s.strip())
     cve_dirs = []
     for item in sorted(ws_root.iterdir()):
         if item.is_dir() and (item / "meta.json").exists():
+            if only and item.name not in only:
+                continue
             cve_dirs.append(str(item.resolve()))
 
     results = []
@@ -1229,9 +1349,25 @@ def subcmd_scan(args):
         "func_vuln_rc", "func_fixed_rc", "exploit_vuln_rc", "exploit_fixed_rc",
         "fv_pfes", "ff_pfes", "ev_pfes", "ef_pfes",
     ]
+    # If we ran a subset via --only, merge into the existing report so prior
+    # rows for other CVEs are preserved.
+    merged: Dict[str, Dict[str, Any]] = {}
+    if only and out_path.exists():
+        with open(out_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        if lines:
+            header = lines[0].split("\t")
+            for ln in lines[1:]:
+                vals = ln.split("\t")
+                if not vals or not vals[0]:
+                    continue
+                merged[vals[0]] = dict(zip(header, vals))
+    for r in results:
+        merged[r["cve_id"]] = r
+    ordered = sorted(merged.values(), key=lambda r: r["cve_id"])
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\t".join(cols) + "\n")
-        for r in results:
+        for r in ordered:
             f.write("\t".join(str(r.get(c, "")) for c in cols) + "\n")
 
     print(f"[+] Scan complete. Report written to {out_path}")
@@ -1292,6 +1428,8 @@ def main():
     p_scan.add_argument("--jobs", type=int, help="number of parallel workers (default: cpu_count()-1)")
     p_scan.add_argument("--timeout", type=int, default=3600,
                         help="per-CVE wall-time cap in seconds (default 3600 = 60 min)")
+    p_scan.add_argument("--only", default="",
+                        help="comma-separated list of vuln_ids to limit the scan to")
     p_scan.set_defaults(func=subcmd_scan)
 
     args = parser.parse_args()

@@ -1,0 +1,10 @@
+{
+  "_note": "test_scanner.py top-level initialize_pickle_files() pickles a payload whose __reduce__ does `import torch.utils.bottleneck.__main__`. Without torch installed, collection errors and the test never runs. Install CPU-only torch so the import resolves; the test never actually invokes torch.load. Pin to torch 2.1.0 because torch>=2.5 removed the torch.utils.bottleneck submodule, and torch 2.1 lacks ShapeEnv.evaluate_guards_expression; 2.4 has both.",
+  "set": {
+    "install_cmds": [
+      "python -m pip install -U pip wheel pytest aiohttp py7zr requests numpy==1.23.4",
+      "python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.4.0'",
+      "pip install -e ."
+    ]
+  }
+}

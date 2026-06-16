@@ -1,0 +1,10 @@
+{
+  "_note": "Same root cause as GHSA-3gf5-cxq9-w223: top-level initialize_pickle_files() needs torch to be importable.",
+  "set": {
+    "install_cmds": [
+      "python -m pip install -U pip wheel pytest aiohttp py7zr requests numpy==1.23.4",
+      "python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.4.0'",
+      "pip install -e ."
+    ]
+  }
+}

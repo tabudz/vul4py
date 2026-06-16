@@ -1,4 +1,4 @@
-# Vul4Py v2
+# Vul4Py 
 
 Clean rebuild of the Vul4Py benchmark and agent-evaluation harness.
 

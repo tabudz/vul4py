@@ -8,9 +8,10 @@ Source of truth: dataset/meta_overrides/<vuln_id>.json
 Each override file supports three operations:
 
     {
-      "set":         { "<field>": <value>, ... },        # replace
-      "drop":        { "<field>": [<item>, ...], ... },  # remove exact items from a list field
-      "drop_prefix": { "<field>": [<prefix>, ...], ... } # remove list items whose value starts with prefix
+      "set":           { "<field>": <value>, ... },        # replace
+      "drop":          { "<field>": [<item>, ...], ... },  # remove exact items from a list field
+      "drop_prefix":   { "<field>": [<prefix>, ...], ... } # remove list items whose value starts with prefix
+      "add_to_lists":  { "<field>": [<item>, ...], ... }   # append to a list field, dedup'd
     }
 
 The override file may also contain "_note" (free-form audit reason) which is ignored.
@@ -41,6 +42,17 @@ def apply(meta: dict, override: dict) -> dict:
         if not isinstance(meta.get(k), list):
             continue
         meta[k] = [x for x in meta[k] if not any(x.startswith(p) for p in prefixes)]
+    for k, items in override.get("add_to_lists", {}).items():
+        existing = list(meta.get(k) or [])
+        for item in items:
+            if item not in existing:
+                existing.append(item)
+        meta[k] = existing
+    for k, items in override.get("remove_from_lists", {}).items():
+        if not isinstance(meta.get(k), list):
+            continue
+        drop_set = set(items)
+        meta[k] = [x for x in meta[k] if x not in drop_set]
     return meta
 
 
