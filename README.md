@@ -99,14 +99,3 @@ python3 scripts/stats.py
 
 `label.py` writes one `results/correct_<agent>.jsonl` (plausibly-fixed only) and a `results/summary.tsv` (every row). `stats.py` prints the cross-agent table.
 
-## Conventions
-
-- All scripts assume `python3` ≥ 3.10 on the host. Per-vuln Python is provisioned automatically by `vul4py.py` via micromamba (no global install required).
-- Vulnerability IDs preserve case (`CVE-…`, `GHSA-…`).
-- Patches are unified diffs against the vulnerable repo root, prefixed `a/` and `b/`.
-- `meta.json` keeps the `cve_id` field name for compatibility with `vul4py.py`; treat it as `vuln_id`.
-
-## What's not in scope here
-
-- The OSV ingestion pipeline lives at `../osv.py` and `../prepare.py`. The output it produces (`../matches.jsonl`) is the input to step 1.
-- The agentic harness runners (OpenHands, Trae, SWE-agent) are not re-implemented; only their output contract (`runs/<agent>/<vuln_id>/patch.diff`) is.
